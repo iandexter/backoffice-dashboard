@@ -1,0 +1,222 @@
+#!/usr/bin/perl
+#
+# Nagios plugin to check flow of messages to and from the Mainframe.
+
+use strict;
+use warnings;
+
+use Getopt::Std;
+use Time::Local qw( timelocal );
+
+$| = 1;
+
+our $VERSION = 1.2;
+
+my $opt_str = 'dhvot:H:S:';
+my %opts;
+
+my $maildir   = '/path/to/mainframe/maildir';
+my $whitelist = '/path/to/mainframe/whitelist.msgs';
+
+my $patt_subject    = qr/Subject:\s+MESSAGE\ FILE\ NOTICE/x;
+my $patt_message_id = qr/\s+(\d{2}[A-Z]{1}\d{5}.+)/x;
+
+my $commandfile   = '/path/to/nagios.cmd';
+my $servicestatus = 0;
+my $servicemessage;
+
+sub printusage {
+    print <<"EOF";
+
+Check messages flowing to and from the Mainframe.
+
+Usage: $0 [-hvo] -t threshold -H service_host -S service_name
+
+  -h : Print this help message.
+  -v : Verbose output.
+  -o : Output to STDOUT only.
+  -t : Threshold value (in minutes).
+  -H : Nagios service host.
+  -S : Nagios service name.
+
+EOF
+    exit 3;
+}
+
+sub getoptions {
+    getopts( $opt_str, \%opts ) or printusage();
+    if ( !scalar %opts || !$opts{t} || !$opts{H} || !$opts{S} || $opts{h} ) {
+        printusage();
+    }
+    return;
+}
+
+sub gettoday {
+    my $path = shift;
+    $path =~ s|/\z||mx;
+
+    opendir my $dir, $path or die "Cannot open $path: $!\n";
+    my @files = grep { !/^\.\.?$/mx && -f "$path/$_" } readdir $dir;
+    closedir $dir or warn "Cannot close $path: $!\n";
+
+    my @sorted;
+    foreach my $fn (@files) {
+        my $mtime = ( stat "$path/$fn" )[9];
+        my $today = timelocal( 0, 0, 0, (localtime)[ 3, 4, 5 ] );
+
+        if ( $mtime >= $today ) { push @sorted, "$path/$fn"; }
+    }
+
+    return @sorted;
+}
+
+sub searchfile {
+    my $pattern = shift;
+    my $logfile = shift;
+
+    my $string = quotemeta $pattern;
+    my $slurp;
+
+    local $/ = undef;
+    my $fh;
+    open $fh, '<', "$logfile" or die "Cannot open $logfile: $!\n";
+    $slurp = <$fh>;
+    close $fh or warn "Cannot close $logfile: $!\n";
+
+    return ( $slurp =~ /$string/mx ) ? 1 : 0;
+}
+
+sub writecommand {
+    my $commandhost = shift;
+    my $commandsvc  = shift;
+    my $status      = shift;
+    my $message     = shift;
+
+    my $extcmd = sprintf "[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s\n",
+      time(), $commandhost, $commandsvc, $status, $message;
+
+    my $fh;
+    open $fh, '>', "$commandfile" or die "Cannot open $commandfile: $!\n";
+    print {$fh} $extcmd;
+    close $fh or warn "Cannot close $commandfile: $!\n";
+    return;
+}
+
+### main()
+
+getoptions();
+
+my $threshold = int $opts{t};
+$threshold *= 60;
+
+if ( $opts{d} ) {
+    $maildir     = '/path/to/mainframe/debug/maildir/';
+    $whitelist   = '/path/to/mainframe/debug/whitelist.msgs';
+    $commandfile = '/path/to/mainframe/debug/nagios.cmd';
+}
+
+my $commandhost = $opts{H};
+my $commandsvc  = $opts{S};
+
+my @files = gettoday($maildir);
+my @skipped;
+my @msg_ids;
+my %msg_hash;
+my @no_pairs;
+my @with_pairs_arr;
+my %with_pairs_hash;
+
+### Parse mail
+foreach my $fn (@files) {
+    my $mtime = ( stat $fn )[9];
+    my $stime = time;
+    if ( ( $stime - $mtime ) < $threshold ) {
+        if ( !searchfile( '( ACK )', $fn ) ) {
+            push @skipped, $fn;
+            next;
+        }
+    }
+    open my $fh, '<', "$fn" or die "Cannot open $fn: $!\n";
+    while (<$fh>) {
+        if (/$patt_subject/mx) {
+            while (<$fh>) {
+                if (/$patt_message_id/mx) { push @msg_ids, $1; }
+            }
+        }
+    }
+    close $fh or warn "Cannot close $fn: $!\n";
+}
+
+$msg_hash{$_}++ foreach @msg_ids;
+
+### Filter message IDs -- first pass
+foreach my $msg_key ( keys %msg_hash ) {
+    if ( -e $whitelist ) {
+        if ( searchfile( $msg_key, $whitelist ) ) {
+            $msg_hash{ $msg_key . ' [WHITELISTED]' } =
+              delete $msg_hash{$msg_key};
+            next;
+        }
+    }
+    if ( $msg_hash{$msg_key} == 1 ) { push @no_pairs, $msg_key; }
+}
+
+### Filter message IDs -- second pass
+if (@no_pairs) {
+    foreach my $nopair (@no_pairs) {
+        foreach my $fn (@files) {
+            if ( searchfile( $nopair, $fn ) ) {
+                push @with_pairs_arr, $nopair;
+            }
+        }
+    }
+}
+$with_pairs_hash{$_}++ foreach @with_pairs_arr;
+@with_pairs_arr = ();
+foreach my $msg_key ( keys %with_pairs_hash ) {
+    if ( $with_pairs_hash{$msg_key} == 2 ) {
+        push @with_pairs_arr, $msg_key;
+    }
+}
+%with_pairs_hash = map { $_ => 1 } @with_pairs_arr;
+@no_pairs = grep { not $with_pairs_hash{$_} } @no_pairs;
+
+### Merge filtered message IDs
+@msg_hash{ keys %with_pairs_hash } = values %with_pairs_hash;
+
+### Output
+if ( $opts{v} ) {
+    printf "Threshold: %d\n", $threshold;
+    printf "Maildir: %s\n",   $maildir;
+    if (@skipped) {
+        printf "\nSkipped mails:\n";
+        printf "%s\n", $_ foreach ( sort @skipped );
+    }
+    if (@no_pairs) {
+        printf "\nMessages above threshold (%d):\n", scalar @no_pairs;
+        printf "%s\n", $_ foreach ( sort @no_pairs );
+    }
+    printf "\nAll messages (%d):\n", scalar keys %msg_hash;
+    printf "%s\n", $_ foreach ( sort keys %msg_hash );
+    print "\n[OUTPUT] ";
+}
+
+if (@no_pairs) {
+    my $num_msgs = ( scalar @no_pairs > 1 ) ? 'messages' : 'message';
+    $servicemessage = sprintf "CRITICAL: %d %s above threshold.",
+      scalar @no_pairs, $num_msgs;
+    $servicestatus = 2;
+} else {
+    my $num_msgs = ( scalar keys %msg_hash > 1 ) ? 'Messages' : 'Message';
+    $servicemessage = sprintf "OK: %s below threshold.", $num_msgs;
+    $servicestatus = 0;
+}
+
+if ( $opts{o} ) {
+    print $servicemessage . "\n";
+} else {
+    writecommand( $commandhost, $commandsvc, $servicestatus, $servicemessage );
+    if ( $opts{v} ) { printf "Wrote to command file: %s\n", $servicemessage; }
+}
+
+exit $servicestatus;

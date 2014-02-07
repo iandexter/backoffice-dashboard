@@ -1,0 +1,161 @@
+#!/usr/bin/perl
+#
+# Trace the flow of messages to and from the Mainframe.
+
+use strict;
+use warnings;
+
+use Time::Local qw( timelocal );
+use Date::Manip qw( UnixDate );
+use POSIX qw( strftime );
+
+$| = 1;
+
+our $VERSION = 0.1;
+
+my $maildir         = '/path/to/mainframe/maildir';
+my $patt_dateheader = qr/Date:\s+(.*)/x;
+my $patt_message_id = qr/\s+(\d{2}[A-Z]{1}\d{5}.+?)/x;
+
+sub searchfile {
+    my $pattern = shift;
+    my $logfile = shift;
+
+    my $string = quotemeta $pattern;
+    my $slurp;
+
+    local $/ = undef;
+    my $fh;
+    open $fh, '<', "$logfile" or die "Cannot open $logfile: $!\n";
+    $slurp = <$fh>;
+    close $fh or warn "Cannot close $logfile: $!\n";
+
+    return ( $slurp =~ /$string/mx ) ? 1 : 0;
+}
+
+sub getfiles {
+    my $timestamp = shift;
+
+    my ( $day, $month, $year, $before, $after );
+    my $patt_subject = 'MESSAGE FILE NOTICE';
+
+    my @sorted;
+
+    if ( $timestamp =~ m/(\d{2})(\d{2})(\d{4})/mx ) {
+        $day    = $1;
+        $month  = $2;
+        $year   = $3;
+        $before = timelocal( 0, 0, 0, $day, $month - 1, $year );
+        $after  = timelocal( 59, 59, 23, $day, $month - 1, $year );
+    } else {
+        $before = timelocal( 0,  0,  0,  (localtime)[ 3, 4, 5 ] );
+        $after  = timelocal( 59, 59, 23, (localtime)[ 3, 4, 5 ] );
+    }
+
+    my @paths = ( $maildir );
+    foreach my $path (@paths) {
+        $path =~ s|/\z||mx;
+        opendir my $dir, $path or die "Cannot open $path: $!\n";
+        my @files = grep { !/^\.\.?$/mx && -f "$path/$_" } readdir $dir;
+        closedir $dir or warn "Cannot close $path: $!\n";
+
+        foreach my $fn (@files) {
+            $fn = "$path/$fn";
+            my $mtime = ( stat $fn )[9];
+
+            if ( ( $mtime >= $before && $mtime <= $after )
+                && searchfile( $patt_subject, $fn ) )
+            {
+                push @sorted, $fn;
+            }
+        }
+    }
+
+    return @sorted;
+}
+
+sub fillhash {
+    my @files = @_;
+    my %msg_hash;
+
+    foreach my $fn (@files) {
+        open my $fh, '<', $fn or die "Cannot open $fn: $!\n";
+        while (<$fh>) {
+            if (/$patt_dateheader/mx) {
+                my $dateheader = UnixDate( $1, '%s' );
+                while (<$fh>) {
+                    if (/$patt_message_id/mx) {
+                        push @{ $msg_hash{$1} }, $dateheader
+                          if defined $dateheader;
+                    }
+                }
+            }
+        }
+    }
+
+    return %msg_hash;
+}
+
+sub fillarray {
+    my %msg_hash = %{ shift() };
+    my @msg_ids;
+
+    foreach my $msg_id ( keys %msg_hash ) {
+        my @msg = ();
+        push @msg, $msg_id;
+        foreach my $timestamp ( sort @{ $msg_hash{$msg_id} } ) {
+            push @msg, $timestamp;
+        }
+        if ( @{ $msg_hash{$msg_id} } > 1 ) {
+            my @timestamps = reverse sort { $a <=> $b } @{ $msg_hash{$msg_id} };
+            push @msg, sprintf "%.2f", ( $timestamps[0] - $timestamps[1] ) / 60;
+        }
+        push @msg_ids, [@msg];
+    }
+
+    return @msg_ids;
+}
+
+sub printlist {
+    my ( $thisdate, $msg_ids ) = @_;
+
+    print "Date: $thisdate\n";
+    printf "%-12s %-16s %-16s %s\n", 'Message ID', 'From Mainframe',
+      'To Mainframe', 'Elapsed';
+    foreach my $msg ( sort { $a->[1] <=> $b->[1] } @{$msg_ids} ) {
+        my $msg_id = $$msg[0];
+        my $msg_sent =
+          defined $$msg[1]
+          ? strftime '%r', localtime( $$msg[1] )
+          : q{};
+        my $msg_ackd =
+          defined $$msg[2]
+          ? strftime '%r', localtime( $$msg[2] )
+          : q{};
+        my $elapsed = defined $$msg[3] ? $$msg[3] : 0.0;
+        printf "%-12s %-16s %-16s %7.2f\n", $msg_id, $msg_sent, $msg_ackd,
+          $elapsed;
+    }
+    return;
+}
+
+### main()
+if (@ARGV) {
+    foreach my $thisdate (@ARGV) {
+        my $i = 1;
+        chomp $thisdate;
+        print "---\n" if ( $i < scalar @ARGV );
+        my @files = getfiles($thisdate);
+        if (@files) {
+            my %msg_hash = fillhash(@files);
+            my @msg_ids  = fillarray( \%msg_hash );
+            printlist( $thisdate, \@msg_ids );
+        } else {
+            print "No files found for $thisdate.\n";
+            next;
+        }
+        $i++;
+    }
+} else {
+    print "Usage: $0 DDMMYYYY [...]\n";
+}

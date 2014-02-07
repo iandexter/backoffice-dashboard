@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+#
+# Nagios plugin to compare messages flowing between ERP and broker.
+
+use strict;
+use warnings;
+
+use Time::Local;
+use POSIX qw(strftime);
+use Getopt::Std;
+
+our $VERSION = 1.3;
+
+my $opt_str = 'dhvt:s:n';
+my %opts;
+
+my $log_directory = '/path/to/broker/logs/';
+my $whitelist     = '/var/tmp/whitelist.msgs';
+
+my $patt_timestamp = qr/\[DATE.*\[([^]]+)\s\]/x;
+my $patt_msgid     = qr/:20:([^\|]+)\|?/x;
+my $timestamp;
+my $msgid;
+
+sub printusage {
+    print <<"EOF";
+
+Compare messages flowing between ERP and broker.
+
+Usage: $0 [-hvt] [threshold]
+
+  -h : Print this help message.
+  -v : Verbose output.
+  -t : Threshold value (in minutes).
+  -s : Specify date (in ddmmYY). (optional)
+  -n : Get messages within threshold.
+
+EOF
+    exit 3;
+}
+
+sub getoptions {
+    getopts( $opt_str, \%opts ) or printusage();
+    printusage() unless scalar %opts;
+    printusage() if $opts{h};
+    printusage() if ( !$opts{t} );
+    return;
+}
+
+sub searchlog {
+    my $pattern = shift;
+    my $logfile = shift;
+
+    my $string = quotemeta $pattern;
+    my $slurp;
+
+    local $/ = undef;
+    my $fh;
+    open $fh, '<', "$logfile" or die "Cannot open $logfile: $!\n";
+    $slurp = <$fh>;
+    close $fh or warn "Cannot close $logfile: $!\n";
+
+    return ( $slurp =~ /$string/mx ) ? 1 : 0;
+}
+
+sub getlatest {
+    my $dir     = shift;
+    my $pattern = shift;
+
+    $dir =~ s|/\z||mx;
+
+    my $today = timelocal( 0, 0, 12, (localtime)[ 3 .. 5 ] );
+    my $today_stamp = strftime '%d%m%Y', localtime $today;
+
+    my $filename = sprintf "%s/%s_messages_%s.log", $dir, $pattern,
+      $today_stamp;
+    return $filename;
+}
+
+sub getdated {
+    my $dir       = shift;
+    my $pattern   = shift;
+    my $timestamp = shift;
+
+    $dir =~ s|/\z||mx;
+
+    my $filename = sprintf "%s/%s_messages_%s.log", $dir, $pattern, $timestamp;
+    return $filename;
+}
+
+sub toepoch {
+    my $timestamp = shift;
+
+    my ( $mon, $mday, $year, $hour, $min, $sec, $ampm ) =
+      split /[\/\s:]/mx, $timestamp;
+    $hour = ( $ampm =~ /PM/mx && $hour < 12 ) ? $hour + 12 : $hour;
+    return timelocal( $sec, $min, $hour, $mday, $mon - 1, $year );
+}
+
+### main()
+
+getoptions();
+
+my $threshold = int $opts{t};
+$threshold *= 60;
+printf "Threshold: %d\n", $threshold if ( $opts{v} );
+my $now = time;
+
+my @all_messages;
+my @above_threshold;
+my @within_threshold;
+
+my $from_erp = getlatest( $log_directory, 'from_erp' );
+my $to_erp   = getlatest( $log_directory, 'to_erp' );
+
+if ( $opts{d} ) {
+    $from_erp  = '/var/tmp/check_erp_msgs/from_erp_messages_debug.log';
+    $to_erp    = '/var/tmp/check_erp_msgs/to_erp_messages_debug.log';
+    $whitelist = '/var/tmp/check_erp_msgs/whitelist.msgs';
+}
+
+if ( $opts{s} ) {
+    $from_erp = getdated( $log_directory, 'from_erp', $opts{s} );
+    $to_erp   = getdated( $log_directory, 'to_erp', $opts{s} );
+}
+
+printf "From: %s\nTo: %s\n", $from_erp, $to_erp if ( $opts{v} );
+
+if ( !-e $from_erp ) {
+    printf "OK: No messages from ERP yet.\n" if ( ! $opts{n} );
+    printf "Log file: %s\n", $from_erp if ( $opts{v} );
+    exit 0;
+}
+
+my $fh;
+open $fh, '<', "$from_erp" or die "Cannot open $from_erp: $!\n";
+while (<$fh>) {
+    if (/$patt_timestamp/mx) {
+        $timestamp = $1;
+        while (<$fh>) {
+            last if /^$/mx;
+            if (/$patt_msgid/mx) {
+                $msgid = $1;
+                if ( !grep { /$msgid/imx } @all_messages ) {
+                    push @all_messages, sprintf "%-15s %s", $msgid, $timestamp;
+                    my $timediff = $now - toepoch($timestamp);
+                    if ( -e $whitelist ) {
+                        if ( searchlog( $msgid, $whitelist ) ) {
+                            if ( searchlog( $timestamp, $whitelist ) ) {
+                                s/$timestamp/$timestamp [WHITELISTED]/mx
+                                  for (@all_messages);
+                                next;
+                            }
+                        }
+                    }
+                    if ( !searchlog( $msgid, $to_erp )
+                        && $timediff > $threshold ) {
+                        push @above_threshold, sprintf "%-15s %s", $msgid,
+                          $timestamp;
+                    } elsif ( $timediff <= $threshold ) {
+                        push @within_threshold, sprintf "%-15s %s", $msgid,
+                          $timestamp;
+                    }
+                }
+            }
+        }
+    }
+}
+close $fh or warn "Cannot close $from_erp: $!\n";
+
+if ( $opts{n} ) {
+    printf "within;%s\n", join ',', @within_threshold if (@within_threshold);
+    printf "above;%s\n", join ',', @above_threshold if (@above_threshold);
+    exit 0;
+}
+
+if (@above_threshold) {
+    my $num_msgs = ( scalar @above_threshold > 1 ) ? 'messages' : 'message';
+    printf "CRITICAL: %d %s above threshold.\n", scalar @above_threshold,
+      $num_msgs;
+    printf "Messages above threshold:\n" if ( $opts{v} );
+    if ( $opts{v} ) { printf "%s\n", $_ foreach (@above_threshold) }
+    exit 2;
+}
+else {
+    my $num_msgs = ( scalar @all_messages > 1 ) ? 'messages' : 'message';
+    printf "OK: %d %s below threshold.\n", scalar @all_messages, $num_msgs;
+    printf "All messages:\n" if ( $opts{v} );
+    if ( $opts{v} ) { printf "%s\n", $_ foreach (@all_messages) }
+    exit 0;
+}

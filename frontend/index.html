@@ -1,0 +1,82 @@
+﻿<!DOCTYPE html>
+<!-- Fetch message IDs from ERP-broker workflow.  -->
+<html>
+    <head>
+        <title>ERP-broker message flow</title>
+        <style type="text/css">/*<![CDATA[*/
+            body, html { width: 95%; height: 100%; overflow: hidden;
+                         font: 12px 'Lucida Console',monospace;
+                         text-align: right; }
+            .header h1 { font-size: 120%; padding: 0; margin: 0; }
+            .scrollable { height: 80%; padding: 0; overflow: auto; }
+            p { padding: 5px 0 0 0; margin: 0; }
+            ul { list-style-type: none; padding: 0; margin; 0; }
+            li { padding-top: 3px; }
+            li.none { color: #00c; background: url('imgs/icon_accept.gif') no-repeat center left; }
+            li.within { color: #0c0; background: url('imgs/action_go.gif') no-repeat center left; }
+            li.above { color: #c00; background: url('imgs/icon_alert.gif') no-repeat center left; }
+        /*]]>*/</style>
+        <script src="js/jquery-1.10.2.js"></script>
+        <script type="text/javascript">/*<![CDATA[*/
+            this_interval = 30 * 1000;
+
+            function getISODateTime(d){
+                var s = function(p){
+                    return (''+p).length<2?'0'+p:''+p;
+                };
+
+                if (typeof d === 'undefined'){
+                    var d = new Date();
+                };
+
+                return s(d.getMonth()+1) + '/' +
+                       s(d.getDate()) + '/' +
+                       s(d.getFullYear()-2000) + ' ' +
+                       s(d.getHours()>12?d.getHours()-12:d.getHours())   + ':' +
+                       s(d.getMinutes()) + ':' +
+                       s(d.getSeconds()) + ' ' +
+                       s(d.getHours()>12?'PM':'AM');
+            }
+
+            function getMessages() {
+                var webserviceAPI =
+                'http://vhost.domain.org:8001/cgi-bin/get_erp_msgs.cgi?threshold=5';
+
+                $.getJSON( webserviceAPI, function(data) {
+                    timestamp = '<p>As of ' + getISODateTime(new Date()) + '</p>';
+                    $('#timestamp').html(timestamp);
+
+                    if (typeof data['within'] != "undefined") {
+                        $('#timestamp').append('Incoming: ' + data['within'].length);
+                    }
+                    if (typeof data['above'] != "undefined") {
+                        $('#timestamp').append(' Above: ' + data['above'].length);
+                    }
+
+                    msgid = '';
+
+                    $.each(data, function(k, v) {
+                        $.each(v, function(i) {
+                            msgid += '<li class="' + k + '">'
+                                  + data[k][i] + '</li>';
+                        });
+                    });
+
+                    $('#result').html(msgid);
+                });
+            }
+
+            getMessages();
+            setInterval(function() {
+                getMessages();
+            }, this_interval);
+        /*]]>*/</script>
+    </head>
+<body>
+    <div class="header"><h1>ERP-broker message flow</h1></div>
+    <div id="timestamp"></div>
+    <div class="scrollable">
+        <ul id="result"></ul>
+    </div>
+</body>
+</html>

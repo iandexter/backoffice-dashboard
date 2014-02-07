@@ -1,0 +1,55 @@
+#!/bin/bash
+#
+# Trace flow of messages through broker; used in conjunction with
+# check_erp_msgs.
+
+check_erp_cmd='/path/to/check_erp_msgs -v -t 15 -s'
+log_path='/path/to/broker/logs/';
+
+grep_date() {
+    patt=$1
+    log_file=$2
+    grep -B2 ${patt} ${log_file} | awk -F\= '/DATE/ {print $NF}' \
+    | sed 's/^\s\+\[\(.\+\)\s\+\]/\1/g' | sort | uniq | tail -n 1 \
+    | awk '{print $2,$3}'
+}
+
+if [[ $# -lt 1 ]] ; then
+    echo "Usage: $0 DDMMYYYY [...]"
+    exit 2
+fi
+
+while [[ -n $1 ]] ; do
+    this_date=${1}
+
+    D=${this_date:0:2}
+    M=${this_date:2:2}
+    Y=${this_date:4}
+    Y2=${this_date:6}
+
+    from_erp="${log_path}/from_erp_messages_${this_date}.log"
+    to_swift="${log_path}/to_swift_messages_${this_date}.log"
+    from_swift="${log_path}/from_swift_messages_${this_date}.log"
+    to_erp="${log_path}/to_erp_messages_${this_date}.log"
+
+    printf "Date: %s\n" "${this_date}"
+
+    printf "%-18s| %-12s| %-12s| %-12s| %-12s| Round trip\n" \
+        "Message ID" "From ERP" "To SWIFT" "From SWIFT" "To ERP"
+
+    for m in $(${check_erp_cmd} ${D}${M}${Y} | awk -v patt="${M}/${D}/${Y2}" \
+	    '{ if ($2 ~ patt) print $1 }') ; do
+        fo=$(grep_date $m ${from_erp})
+        ts=$(grep_date $m ${to_swift})
+        fs=$(grep_date $m ${from_swift})
+        to=$(grep_date $m ${to_erp})
+        e_fo=$(date --date="${M}/${D}/${Y} ${fo}" +%s)
+        e_to=$(date --date="${M}/${D}/${Y} ${to}" +%s)
+        rt=$( echo "(${e_to} - ${e_fo}) / 60" | bc -l )
+	    printf "%-18s| %-12s| %-12s| %-12s| %-12s| %6.2f\n" \
+            "${m}" "${fo}" "${ts}" "${fs}" "${to}" "${rt}"
+    done
+
+    echo "---"
+    shift
+done
